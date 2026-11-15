@@ -14,16 +14,25 @@ internal sealed class Catalog
     public Dictionary<string, string> Covers { get; set; } = [];
     public Dictionary<string, string> Series { get; set; } = [];
     public Dictionary<string, DateTime> Added { get; set; } = [];
+    public Dictionary<string, string> Albums { get; set; } = [];
+    public Dictionary<string, string?> LastAssignment { get; set; } = [];
+    public bool PhotoOnly { get; set; } = true;
+    public bool SingleColumn { get; set; }
+    public double TileHeight { get; set; } = 400;
     public bool HideMarked { get; set; } = true;
 }
 
-internal sealed record Photo(string Key, string Path, string Album, string Title, DateTime Added);
+internal sealed record Photo(string Key, string Path, string Album, string Title, DateTime Added)
+{
+    public bool IsVideo => System.IO.Path.GetExtension(Path).Equals(".mp4", StringComparison.OrdinalIgnoreCase);
+    public bool IsGif => System.IO.Path.GetExtension(Path).Equals(".gif", StringComparison.OrdinalIgnoreCase);
+}
 internal sealed record ImportResult(int Added, int Duplicates, int Failed);
 
 internal sealed class Library
 {
     private static readonly HashSet<string> Extensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff" };
+        { ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".mp4" };
     private readonly string root;
     private readonly string catalogPath;
     private readonly string thumbnailDirectory;
@@ -69,12 +78,13 @@ internal sealed class Library
         string album = parts.Length == 1 ? "References" : parts[0];
         if (album.Equals("Dere", StringComparison.OrdinalIgnoreCase) && parts.Length > 2)
             album += "/" + parts[1];
-        return new Photo(key, p, album, Path.GetFileNameWithoutExtension(p),
+        return new Photo(key, p, State.Albums.GetValueOrDefault(key, album), Path.GetFileNameWithoutExtension(p),
             State.Added.GetValueOrDefault(key, File.GetCreationTimeUtc(p)));
     }).ToList();
 
     public async Task<BitmapSource?> Preview(Photo photo, bool thumbnail, CancellationToken token = default)
     {
+        if (photo.IsVideo) return null;
         await decoders.WaitAsync(token);
         try
         {
@@ -83,14 +93,14 @@ internal sealed class Library
                 token.ThrowIfCancellationRequested();
                 var info = new FileInfo(photo.Path);
                 var key = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(
-                    $"{photo.Key}|{info.Length}|{info.LastWriteTimeUtc.Ticks}")));
+                    $"v2|{photo.Key}|{info.Length}|{info.LastWriteTimeUtc.Ticks}")));
                 string cache = Path.Combine(thumbnailDirectory, key + ".jpg");
                 if (thumbnail && File.Exists(cache))
                 {
                     try { return LoadBitmap(cache); }
                     catch (Exception error) when (error is IOException or NotSupportedException or FormatException) { }
                 }
-                int size = thumbnail ? 440 : 4096;
+                int size = thumbnail ? 820 : 4096;
                 BitmapSource bitmap = Path.GetExtension(photo.Path).Equals(".webp", StringComparison.OrdinalIgnoreCase)
                     ? DecodeWebp(photo.Path, size)
                     : DecodeWindows(photo.Path, size);
@@ -232,10 +242,29 @@ internal sealed class Library
     public async Task Verify(string report)
     {
         var photos = Scan();
-        var examples = photos.GroupBy(p => Path.GetExtension(p.Path).ToLowerInvariant()).Select(g => g.First()).ToList();
+        var examples = photos.Where(p => !p.IsVideo).GroupBy(p => Path.GetExtension(p.Path).ToLowerInvariant()).Select(g => g.First()).ToList();
         foreach (var photo in examples)
             if (await Preview(photo, true) is null || await Preview(photo, false) is null)
                 throw new IOException($"Не удалось открыть {photo.Key}");
-        File.WriteAllText(report, JsonSerializer.Serialize(new { Photos = photos.Count, Formats = examples.Select(p => Path.GetExtension(p.Path)), Albums = photos.Select(p => p.Album).Distinct().Count(), Favorites = State.Favorites.Count }, new JsonSerializerOptions { WriteIndented = true }));
+        var movies = photos.Where(p => p.IsVideo).ToList();
+        bool? videoOpened = null;
+        if (movies.Count > 0)
+        {
+            var player = new MediaPlayer { IsMuted = true };
+            var opened = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            player.MediaOpened += (_, _) => opened.TrySetResult(player.HasVideo);
+            player.MediaFailed += (_, _) => opened.TrySetResult(false);
+            player.Open(new Uri(movies[0].Path));
+            player.Play();
+            try { videoOpened = await opened.Task.WaitAsync(TimeSpan.FromSeconds(8)); }
+            catch (TimeoutException) { videoOpened = false; }
+            finally { player.Close(); }
+        }
+        File.WriteAllText(report, JsonSerializer.Serialize(new
+        {
+            Photos = photos.Count - movies.Count, Videos = movies.Count, VideoOpened = videoOpened,
+            Formats = examples.Select(p => Path.GetExtension(p.Path)),
+            Albums = photos.Select(p => p.Album).Distinct().Count(), Favorites = State.Favorites.Count
+        }, new JsonSerializerOptions { WriteIndented = true }));
     }
 }

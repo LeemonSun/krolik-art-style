@@ -33,8 +33,8 @@ public partial class App : Application
             var window = new Gallery(library);
             MainWindow = window;
             window.Show();
-            if (e.Args.Length == 2 && e.Args[0] == "--capture")
-                await window.Capture(e.Args[1]);
+            if (e.Args.Length == 2 && e.Args[0] is "--capture" or "--capture-gallery")
+                await window.Capture(e.Args[1], e.Args[0] == "--capture-gallery");
         }
         catch (Exception error)
         {

@@ -16,7 +16,6 @@ internal sealed class Gallery : Window
     private static readonly Brush Gold = Paint("#DABA91");
     private static readonly Brush Panel = Paint("#201E28");
     private static readonly Brush Line = Paint("#3A3442");
-    private const int PageSize = 24;
     private readonly Library library;
     private readonly Grid shell = new();
     private readonly StackPanel nav = new();
@@ -29,9 +28,16 @@ internal sealed class Gallery : Window
     private CancellationTokenSource loading = new();
     private string section = "home";
     private string? series;
-    private int page;
     private bool importing;
     private bool newest;
+    private bool onlyAlbumFavorites;
+    private List<Photo> galleryPhotos = [];
+    private StackPanel? visibleRows;
+    private Border? beforeRows;
+    private Border? afterRows;
+    private int firstRow = -1, lastRow = -1, columns;
+    private double rowHeight;
+    private CancellationTokenSource rowLoading = new();
 
     public Gallery(Library library)
     {
@@ -76,8 +82,7 @@ internal sealed class Gallery : Window
         search.TextChanged += (_, _) =>
         {
             hint.Visibility = search.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-            page = 0;
-            Render();
+            Render(resetScroll: true);
         };
         var tools = new StackPanel { Orientation = Orientation.Horizontal };
         DockPanel.SetDock(tools, Dock.Right);
@@ -88,6 +93,12 @@ internal sealed class Gallery : Window
         DockPanel.SetDock(toolbar, Dock.Top);
         body.Children.Add(toolbar);
         scroll.Content = content;
+        scroll.ScrollChanged += (_, _) => ShowVisibleRows();
+        SizeChanged += (_, _) =>
+        {
+            if (visibleRows is not null)
+                Dispatcher.BeginInvoke(() => { if (visibleRows is not null) ShowVisibleRows(); });
+        };
         body.Children.Add(scroll);
         PreviewKeyDown += (_, e) =>
         {
@@ -99,7 +110,7 @@ internal sealed class Gallery : Window
             }
         };
         Closing += (_, e) => { if (importing) e.Cancel = true; };
-        Closed += (_, _) => loading.Cancel();
+        Closed += (_, _) => { loading.Cancel(); rowLoading.Cancel(); };
         photos = library.Scan();
         Render();
     }
@@ -128,11 +139,11 @@ internal sealed class Gallery : Window
         selected.Clear();
         section = destination;
         series = selectedSeries;
-        page = 0;
+        onlyAlbumFavorites = false;
         if (search.Text.Length > 0)
             search.Clear();
         else
-            Render();
+            Render(resetScroll: true);
     }
 
     private void AddNav(string key, string text, int? number = null, bool indent = false)
@@ -146,19 +157,23 @@ internal sealed class Gallery : Window
         nav.Children.Add(row);
     }
 
-    private void Render()
+    private void Render(bool resetScroll = false)
     {
+        double position = resetScroll ? 0 : scroll.VerticalOffset;
+        visibleRows = null;
+        rowLoading.Cancel();
         loading.Cancel();
         loading.Dispose();
         loading = new CancellationTokenSource();
         nav.Children.Clear();
         content.Children.Clear();
         if (!importing)
-            status.Text = $"{photos.Count:N0} изображений\nЛокальная библиотека";
+        status.Text = $"{photos.Count:N0} файлов\nЛокальная библиотека";
         var albums = photos.GroupBy(p => p.Album).OrderBy(g => Rank(g.Key)).ThenBy(g => g.Key).ToList();
         AddNav("home", "Коллекция");
         AddNav("all", "Все изображения");
         AddNav("favorites", "Избранное", photos.Count(p => library.State.Favorites.Contains(p.Key)));
+        AddNav("inbox", "Входящие", photos.Count(IsInbox));
         AddNav("recent", "Недавно добавленные");
         nav.Children.Add(Label("АЛЬБОМЫ", 10, Muted, true, new Thickness(24, 20, 10, 6)));
         foreach (var album in albums)
@@ -187,6 +202,8 @@ internal sealed class Gallery : Window
         {
             var filtered = Filter(query).ToList();
             ContentHeader(query, filtered.Count);
+            if (query.Length == 0 && series is null && albums.Any(g => g.Key == section) && !library.State.PhotoOnly)
+                AlbumCard(filtered);
             if (query.Length == 0 && series is null && albums.Any(g => g.Key == section))
             {
                 var stacks = filtered.Where(p => library.State.Series.ContainsKey(p.Key))
@@ -200,13 +217,16 @@ internal sealed class Gallery : Window
                         chips.Children.Add(Action($"{name}  ·  {stack.Count()}", () => Go(section, name)));
                     }
                     content.Children.Add(chips);
-                    filtered = filtered.Where(p => !library.State.Series.ContainsKey(p.Key))
-                        .Concat(stacks.Select(g => g.First())).ToList();
+                    if (!library.State.PhotoOnly && !onlyAlbumFavorites)
+                        filtered = filtered.Where(p => !library.State.Series.ContainsKey(p.Key))
+                            .Concat(stacks.Select(g => g.First())).ToList();
                 }
             }
             GalleryPage(filtered);
         }
-        scroll.ScrollToTop();
+        scroll.UpdateLayout();
+        scroll.ScrollToVerticalOffset(position);
+        ShowVisibleRows();
     }
 
     private static int Rank(string key) => key switch
@@ -238,7 +258,7 @@ internal sealed class Gallery : Window
         stage.Children.Add(new Border { Background = gradient, CornerRadius = new CornerRadius(10) });
         var title = new StackPanel { Margin = new Thickness(30, 0, 18, 0), VerticalAlignment = VerticalAlignment.Center };
         title.Children.Add(Label("Бестиарий", 56, Ink, true));
-        title.Children.Add(Label($"{photos.Count:N0} изображений в коллекции", 15, Gold, inset: new Thickness(3, 6, 0, 0)));
+        title.Children.Add(Label($"{photos.Count:N0} файлов в коллекции", 15, Gold, inset: new Thickness(3, 6, 0, 0)));
         stage.Children.Add(title);
         var panel = Frame(stage);
         panel.Margin = new Thickness(0, 0, 0, 15);
@@ -250,16 +270,38 @@ internal sealed class Gallery : Window
         IEnumerable<Photo> result = photos;
         if (query.Length > 0)
         {
-            result = result.Where(p => p.Key.Contains(query, StringComparison.OrdinalIgnoreCase)
+            result = result.Where(p => p.Key.Contains(query, StringComparison.OrdinalIgnoreCase) || p.Album.Contains(query, StringComparison.OrdinalIgnoreCase)
                 || (library.State.Series.GetValueOrDefault(p.Key)?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false));
         }
         else if (section == "favorites")
             result = result.Where(p => library.State.Favorites.Contains(p.Key));
+        else if (section == "inbox")
+            result = result.Where(IsInbox);
         else if (section is not ("recent" or "all"))
             result = result.Where(p => p.Album == section);
+        if (onlyAlbumFavorites) result = result.Where(p => library.State.Favorites.Contains(p.Key));
         if (series is not null && query.Length == 0)
             result = result.Where(p => library.State.Series.GetValueOrDefault(p.Key) == series);
-        return section == "recent" || newest ? result.OrderByDescending(p => p.Added).ThenBy(p => p.Key) : result.OrderBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase);
+        return section is "recent" or "inbox" || newest ? result.OrderByDescending(p => p.Added).ThenBy(p => p.Key) : result.OrderBy(p => p.Key, StringComparer.CurrentCultureIgnoreCase);
+    }
+
+    private bool IsInbox(Photo p) => p.Key.StartsWith("Imports/", StringComparison.OrdinalIgnoreCase) && !library.State.Albums.ContainsKey(p.Key);
+
+    private void AlbumCard(List<Photo> items)
+    {
+        if (items.Count == 0) return;
+        var cover = items.FirstOrDefault(p => p.Key == library.State.Covers.GetValueOrDefault(section))
+            ?? items.OrderBy(CoverRank).ThenBy(p => p.Key).First();
+        var panel = new StackPanel { Orientation = Orientation.Horizontal };
+        var art = Tile(cover, "Обложка", "", () => OpenViewer(items, items.IndexOf(cover)), Menu(cover));
+        ((FrameworkElement)art).Width = 226;
+        panel.Children.Add(art);
+        var description = new StackPanel { Margin = new Thickness(15, 15, 0, 10) };
+        description.Children.Add(Label(section.Split('/')[^1], 26, Gold, true));
+        description.Children.Add(Label($"{items.Count:N0} кадров  ·  {items.Count(p => library.State.Favorites.Contains(p.Key))} в избранном", 13, Muted));
+        description.Children.Add(Action(onlyAlbumFavorites ? "Все кадры" : "Избранное альбома", () => { onlyAlbumFavorites = !onlyAlbumFavorites; Render(true); }));
+        panel.Children.Add(description);
+        content.Children.Add(panel);
     }
 
     private void ContentHeader(string query, int count)
@@ -269,17 +311,37 @@ internal sealed class Gallery : Window
         DockPanel.SetDock(command, Dock.Right);
         if (series is not null)
             command.Children.Add(Action("Все серии", () => Go(section)));
-        command.Children.Add(Action(newest ? "По дате ↓" : "По имени", () => { newest = !newest; page = 0; Render(); }));
+        command.Children.Add(Action(library.State.PhotoOnly ? "Только фото ✓" : "Только фото", () => Mutate(() => library.State.PhotoOnly = !library.State.PhotoOnly)));
+        command.Children.Add(Action(library.State.SingleColumn ? "В один столбец ✓" : "В один столбец",
+            () => Mutate(() => library.State.SingleColumn = !library.State.SingleColumn)));
+        var size = new Slider { Minimum = 200, Maximum = 760, Width = 95, Margin = new Thickness(8, 0, 4, 0),
+            Value = library.State.TileHeight, ToolTip = "Размер кадра", VerticalAlignment = VerticalAlignment.Center };
+        size.ValueChanged += (_, _) =>
+        {
+            library.State.TileHeight = size.Value;
+            ShowVisibleRows();
+        };
+        size.PreviewMouseLeftButtonUp += (_, _) => Mutate(() => { }, false);
+        size.PreviewKeyUp += (_, _) => Mutate(() => { }, false);
+        command.Children.Add(size);
+        command.Children.Add(Action(newest ? "По дате ↓" : "По имени", () => { newest = !newest; Render(true); }));
+        if (section == "favorites" && count > 0)
+            command.Children.Add(Action("Случайно", () => OpenViewer(Filter(query).OrderBy(_ => Random.Shared.Next()).ToList(), 0)));
+        if (library.State.LastAssignment.Count > 0 && section == "inbox")
+            command.Children.Add(Action("Отменить сортировку", UndoAssignment));
         if (selected.Count > 0)
         {
             command.Children.Add(Action($"В серию · {selected.Count}", () => SetSeries(photos.Where(p => selected.Contains(p.Key)).ToList())));
+            command.Children.Add(Action("В альбом", AssignAlbum));
+            if (selected.Count == 2)
+                command.Children.Add(Action("Сравнить", CompareSelection));
             command.Children.Add(Action("Снять выделение", () => { selected.Clear(); Render(); }));
         }
         header.Children.Add(command);
         var titles = new StackPanel();
         titles.Children.Add(Label(query.Length > 0 ? "Поиск" : series ?? (section switch
         {
-            "all" => "Все изображения", "recent" => "Недавно добавленные", "favorites" => "Избранное", _ => section.Split('/')[^1]
+            "all" => "Все изображения", "recent" => "Недавно добавленные", "favorites" => "Избранное", "inbox" => "Входящие", _ => section.Split('/')[^1]
         }), 34, Ink, true));
         titles.Children.Add(Label($"{count:N0} фото", 13, Muted));
         header.Children.Add(titles);
@@ -288,63 +350,84 @@ internal sealed class Gallery : Window
 
     private void GalleryPage(List<Photo> results)
     {
-        int pages = Math.Max(1, (results.Count + PageSize - 1) / PageSize);
-        page = Math.Clamp(page, 0, pages - 1);
         if (results.Count == 0)
         {
             content.Children.Add(Label("Здесь пока нет изображений", 17, Muted, inset: new Thickness(0, 20, 0, 0)));
             return;
         }
-        if (pages > 1) content.Children.Add(Pager(pages));
-        var grid = new UniformGrid { Columns = 4 };
-        foreach (Photo photo in results.Skip(page * PageSize).Take(PageSize))
+        galleryPhotos = results;
+        firstRow = lastRow = -1;
+        beforeRows = new Border();
+        afterRows = new Border();
+        visibleRows = new StackPanel();
+        content.Children.Add(beforeRows);
+        content.Children.Add(visibleRows);
+        content.Children.Add(afterRows);
+        ShowVisibleRows();
+    }
+
+    private void ShowVisibleRows()
+    {
+        if (visibleRows is null || beforeRows is null || afterRows is null) return;
+        double width = scroll.ViewportWidth > 100 ? scroll.ViewportWidth : Math.Max(550, ActualWidth - 280);
+        double height = library.State.TileHeight;
+        int columnCount = library.State.SingleColumn ? 1 : Math.Clamp((int)(width / (height * 0.72)), 1, 6);
+        double stride = height + (library.State.PhotoOnly ? 12 : 60);
+        var gridOrigin = beforeRows.TranslatePoint(new Point(0, 0), content).Y;
+        int rowCount = (galleryPhotos.Count + columnCount - 1) / columnCount;
+        int start = Math.Clamp((int)Math.Floor((scroll.VerticalOffset - gridOrigin) / stride) - 1, 0, rowCount - 1);
+        int end = Math.Min(rowCount, start + Math.Max(3, (int)Math.Ceiling(scroll.ViewportHeight / stride) + 3));
+        if (start == firstRow && end == lastRow && columns == columnCount && rowHeight == height) return;
+        firstRow = start;
+        lastRow = end;
+        columns = columnCount;
+        rowHeight = height;
+        rowLoading.Cancel();
+        rowLoading.Dispose();
+        rowLoading = new CancellationTokenSource();
+        beforeRows.Height = start * stride;
+        afterRows.Height = (rowCount - end) * stride;
+        visibleRows.Children.Clear();
+        for (int row = start; row < end; row++)
         {
-            string? stack = library.State.Series.GetValueOrDefault(photo.Key);
-            bool grouped = stack is not null && section == photo.Album && series is null && search.Text.Length == 0;
-            int index = results.IndexOf(photo);
-            string caption = grouped ? stack! : photo.Title;
-            string subtitle = grouped ? $"{photos.Count(p => p.Album == section && library.State.Series.GetValueOrDefault(p.Key) == stack)} фото в серии" : photo.Album.Split('/')[^1];
-            grid.Children.Add(Tile(photo, caption, subtitle, () =>
+            var grid = new UniformGrid { Columns = columnCount, Rows = 1, Height = stride };
+            for (int column = 0; column < columnCount; column++)
             {
-                if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && !grouped)
+                int index = row * columnCount + column;
+                if (index >= galleryPhotos.Count) break;
+                var photo = galleryPhotos[index];
+                string? stack = library.State.Series.GetValueOrDefault(photo.Key);
+                bool grouped = !library.State.PhotoOnly && stack is not null && !onlyAlbumFavorites && section == photo.Album && series is null && search.Text.Length == 0;
+                string subtitle = grouped ? $"{photos.Count(p => p.Album == section && library.State.Series.GetValueOrDefault(p.Key) == stack)} фото в серии" : photo.Album.Split('/')[^1];
+                grid.Children.Add(Tile(photo, grouped ? stack! : photo.Title, subtitle, () =>
                 {
-                    Toggle(selected, photo.Key);
-                    Render();
-                }
-                else if (grouped) Go(section, stack);
-                else OpenViewer(results, index);
-            }, Menu(photo)));
+                    if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && !grouped)
+                    {
+                        Toggle(selected, photo.Key);
+                        Render();
+                    }
+                    else if (grouped) Go(section, stack);
+                    else OpenViewer(galleryPhotos, index);
+                }, Menu(photo), true));
+            }
+            visibleRows.Children.Add(grid);
         }
-        content.Children.Add(grid);
-        if (pages > 1) content.Children.Add(Pager(pages));
     }
 
-    private UIElement Pager(int pages)
+    private UIElement Tile(Photo photo, string title, string subtitle, Action open, ContextMenu? menu, bool inGallery = false)
     {
-        var row = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 0, 10, 12) };
-        var previous = Action("‹", () => { page--; Render(); }, "Предыдущая страница");
-        previous.IsEnabled = page > 0;
-        var next = Action("›", () => { page++; Render(); }, "Следующая страница");
-        next.IsEnabled = page + 1 < pages;
-        row.Children.Add(previous);
-        row.Children.Add(Label($"{page + 1} / {pages}", 13, Muted, inset: new Thickness(12, 7, 6, 0)));
-        row.Children.Add(next);
-        return row;
-    }
-
-    private UIElement Tile(Photo photo, string title, string subtitle, Action open, ContextMenu? menu)
-    {
+        bool only = inGallery && library.State.PhotoOnly;
         bool hidden = library.State.HideMarked && library.State.Hidden.Contains(photo.Key);
-        var art = new Grid { Height = 177, ClipToBounds = true, Background = Paint("#191721") };
-        var image = new Image { Stretch = Stretch.UniformToFill };
-        var placeholder = Label(hidden ? "Превью скрыто" : "", 13, Muted);
+        var art = new Grid { Height = inGallery ? library.State.TileHeight : 177, ClipToBounds = true, Background = Paint("#191721") };
+        var image = new Image { Stretch = only ? Stretch.Uniform : Stretch.UniformToFill };
+        var placeholder = Label(hidden ? "Превью скрыто" : photo.IsVideo ? "▶  Видео" : "", 13, Muted);
         placeholder.HorizontalAlignment = HorizontalAlignment.Center;
         placeholder.VerticalAlignment = VerticalAlignment.Center;
         art.Children.Add(image);
         art.Children.Add(placeholder);
-        if (!hidden)
-            _ = LoadImage(photo, image, placeholder, loading.Token);
-        if (library.State.Favorites.Contains(photo.Key))
+        if (!hidden && !photo.IsVideo)
+            _ = LoadImage(photo, image, placeholder, inGallery ? rowLoading.Token : loading.Token);
+        if (!only && library.State.Favorites.Contains(photo.Key))
         {
             var badge = Label("♥", 16, Gold, true, new Thickness(9));
             badge.HorizontalAlignment = HorizontalAlignment.Right;
@@ -352,14 +435,17 @@ internal sealed class Gallery : Window
         }
         var stack = new StackPanel();
         stack.Children.Add(art);
-        stack.Children.Add(Label(title, 15, Ink, true, new Thickness(11, 8, 11, 2)));
-        stack.Children.Add(Label(subtitle, 12, Muted, inset: new Thickness(11, 0, 11, 9)));
+        if (!only)
+        {
+            stack.Children.Add(Label(title, 15, Ink, true, new Thickness(11, 8, 11, 2)));
+            stack.Children.Add(Label(subtitle, 12, Muted, inset: new Thickness(11, 0, 11, 9)));
+        }
         var button = Action("", open);
         button.Content = stack;
         button.Padding = new Thickness(0);
         button.Margin = new Thickness(0, 0, 10, 12);
         button.HorizontalContentAlignment = HorizontalAlignment.Stretch;
-        button.ToolTip = title;
+        if (!only) button.ToolTip = title;
         button.ContextMenu = menu;
         if (menu is not null && selected.Contains(photo.Key))
             button.BorderBrush = Gold;
@@ -444,6 +530,53 @@ internal sealed class Gallery : Window
         Render();
     }
 
+    private void AssignAlbum()
+    {
+        var dialog = new Window { Owner = this, Title = "Назначить альбом", Width = 400, Height = 165,
+            ResizeMode = ResizeMode.NoResize, WindowStartupLocation = WindowStartupLocation.CenterOwner, Background = Paint("#191720") };
+        var panel = new StackPanel { Margin = new Thickness(15) };
+        panel.Children.Add(Label($"Кадров выбрано: {selected.Count}"));
+        var choices = new ComboBox { Margin = new Thickness(0, 10, 0, 10), IsEditable = true };
+        choices.ItemsSource = photos.Select(p => p.Album).Concat(["Henkai", "Other References", "Random References", "Off Topic"])
+            .Where(name => name != "Imports").Distinct().Order().ToList();
+        choices.Text = "Other References";
+        panel.Children.Add(choices);
+        panel.Children.Add(Action("Сохранить", () => dialog.DialogResult = true));
+        dialog.Content = panel;
+        if (dialog.ShowDialog() != true || string.IsNullOrWhiteSpace(choices.Text)) return;
+        string album = choices.Text.Trim();
+        Mutate(() =>
+        {
+            library.State.LastAssignment.Clear();
+            foreach (string key in selected)
+            {
+                library.State.LastAssignment[key] = library.State.Albums.GetValueOrDefault(key);
+                library.State.Albums[key] = album;
+            }
+            selected.Clear();
+            photos = library.Scan();
+        });
+    }
+
+    private void UndoAssignment() => Mutate(() =>
+    {
+        foreach (var item in library.State.LastAssignment)
+            if (item.Value is null) library.State.Albums.Remove(item.Key);
+            else library.State.Albums[item.Key] = item.Value;
+        library.State.LastAssignment.Clear();
+        photos = library.Scan();
+    });
+
+    private void CompareSelection()
+    {
+        var pair = photos.Where(p => selected.Contains(p.Key) && !p.IsVideo).Take(2).ToList();
+        if (pair.Count == 2)
+        {
+            new Comparison(this, library, pair[0], pair[1]).ShowDialog();
+            Render();
+        }
+    }
+
     private async void Import()
     {
         if (importing) return;
@@ -455,15 +588,24 @@ internal sealed class Gallery : Window
         {
             var result = await library.Import(picker.FolderName, photos, new Progress<string>(value => status.Text = value));
             photos = library.Scan();
-            Go("recent");
+            Go("inbox");
             MessageBox.Show(this, $"Добавлено: {result.Added:N0}\nТочных дублей: {result.Duplicates:N0}\nОшибок: {result.Failed:N0}", "Импорт завершён");
         }
         catch (Exception error) { MessageBox.Show(this, error.Message, "Импорт остановлен"); }
         finally { importing = false; Render(); }
     }
 
-    internal async Task Capture(string file)
+    internal async Task Capture(string file, bool gallery = false)
     {
+        if (gallery)
+        {
+            Go("all");
+            await Task.Delay(450);
+            scroll.ScrollToVerticalOffset(1300);
+            await Task.Delay(350);
+            if (galleryPhotos.Count > 30 && firstRow <= 0)
+                throw new InvalidOperationException("Прокрутка галереи не загрузила следующие строки.");
+        }
         await Task.Delay(2300);
         var bitmap = new RenderTargetBitmap((int)ActualWidth, (int)ActualHeight, 96, 96, PixelFormats.Pbgra32);
         bitmap.Render(shell);
