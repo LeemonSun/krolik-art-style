@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using SkiaSharp;
+using Microsoft.VisualBasic.FileIO;
 
 namespace Bestiary;
 
@@ -37,6 +38,8 @@ internal sealed class Library
     private readonly string catalogPath;
     private readonly string thumbnailDirectory;
     private readonly SemaphoreSlim decoders = new(3);
+    private readonly Dictionary<string, BitmapSource> recentThumbnails = [];
+    private readonly Queue<string> thumbnailOrder = new();
     public string PhotosDirectory { get; }
     public Catalog State { get; }
 
@@ -71,24 +74,39 @@ internal sealed class Library
         RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint
     }).Where(p => Extensions.Contains(Path.GetExtension(p)));
 
-    public List<Photo> Scan() => Files(PhotosDirectory).Select(p =>
+    public List<Photo> Scan()
     {
-        string key = Path.GetRelativePath(PhotosDirectory, p).Replace('\\', '/');
-        string[] parts = key.Split('/');
-        string album = parts.Length == 1 ? "References" : parts[0];
-        if (album.Equals("Dere", StringComparison.OrdinalIgnoreCase) && parts.Length > 2)
-            album += "/" + parts[1];
-        return new Photo(key, p, State.Albums.GetValueOrDefault(key, album), Path.GetFileNameWithoutExtension(p),
-            State.Added.GetValueOrDefault(key, File.GetCreationTimeUtc(p)));
-    }).ToList();
+        recentThumbnails.Clear();
+        thumbnailOrder.Clear();
+        return Files(PhotosDirectory).Select(p =>
+        {
+            string key = Path.GetRelativePath(PhotosDirectory, p).Replace('\\', '/');
+            string[] parts = key.Split('/');
+            string album = parts.Length == 1 ? "References" : parts[0];
+            if (album.Equals("Dere", StringComparison.OrdinalIgnoreCase) && parts.Length > 2)
+                album += "/" + parts[1];
+            return new Photo(key, p, State.Albums.GetValueOrDefault(key, album), Path.GetFileNameWithoutExtension(p),
+                State.Added.GetValueOrDefault(key, File.GetCreationTimeUtc(p)));
+        }).ToList();
+    }
 
-    public async Task<BitmapSource?> Preview(Photo photo, bool thumbnail, CancellationToken token = default)
+    public void Recycle(Photo photo)
+    {
+        string relative = Path.GetRelativePath(PhotosDirectory, Path.GetFullPath(photo.Path));
+        if (Path.IsPathRooted(relative) || relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar))
+            throw new IOException("Файл находится вне фототеки Bestiary.");
+        FileSystem.DeleteFile(photo.Path, UIOption.AllDialogs, RecycleOption.SendToRecycleBin, UICancelOption.ThrowException);
+    }
+
+    public async Task<BitmapSource?> Preview(Photo photo, bool thumbnail, CancellationToken token = default, int maxSize = 4096)
     {
         if (photo.IsVideo) return null;
+        token.ThrowIfCancellationRequested();
+        if (thumbnail && recentThumbnails.TryGetValue(photo.Key, out var existing)) return existing;
         await decoders.WaitAsync(token);
         try
         {
-            return await Task.Run(() =>
+            var result = await Task.Run(() =>
             {
                 token.ThrowIfCancellationRequested();
                 var info = new FileInfo(photo.Path);
@@ -100,7 +118,7 @@ internal sealed class Library
                     try { return LoadBitmap(cache); }
                     catch (Exception error) when (error is IOException or NotSupportedException or FormatException) { }
                 }
-                int size = thumbnail ? 820 : 4096;
+                int size = thumbnail ? 820 : maxSize;
                 BitmapSource bitmap = Path.GetExtension(photo.Path).Equals(".webp", StringComparison.OrdinalIgnoreCase)
                     ? DecodeWebp(photo.Path, size)
                     : DecodeWindows(photo.Path, size);
@@ -120,6 +138,13 @@ internal sealed class Library
                 }
                 return bitmap;
             }, token);
+            token.ThrowIfCancellationRequested();
+            if (thumbnail && recentThumbnails.TryAdd(photo.Key, result))
+            {
+                thumbnailOrder.Enqueue(photo.Key);
+                if (thumbnailOrder.Count > 52) recentThumbnails.Remove(thumbnailOrder.Dequeue());
+            }
+            return result;
         }
         catch (Exception error) when (error is not OperationCanceledException) { return null; }
         finally { decoders.Release(); }

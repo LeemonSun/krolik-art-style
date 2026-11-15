@@ -25,6 +25,7 @@ internal sealed class Viewer : Window
     private readonly DispatcherTimer animation = new();
     private readonly Button play;
     private readonly DockPanel bar = new();
+    private readonly Func<Photo, Window, ContextMenu> fileMenu;
     private IReadOnlyList<BitmapFrame> gif = [];
     private int gifIndex;
     private bool playingVideo;
@@ -32,12 +33,14 @@ internal sealed class Viewer : Window
     private CancellationTokenSource loading = new();
     private int index;
 
-    public Viewer(Window owner, Library library, IReadOnlyList<Photo> photos, int index)
+    public Viewer(Window owner, Library library, IReadOnlyList<Photo> photos, int index,
+        Func<Photo, Window, ContextMenu> fileMenu)
     {
         Owner = owner;
         this.library = library;
         this.photos = photos;
         this.index = index;
+        this.fileMenu = fileMenu;
         Title = "Bestiary · Просмотр";
         WindowStyle = WindowStyle.None;
         WindowState = WindowState.Maximized;
@@ -237,6 +240,7 @@ internal sealed class Viewer : Window
         var token = loading.Token;
         var photo = photos[index];
         caption.Text = $"{index + 1} / {photos.Count}   ·   {photo.Title}";
+        stage.ContextMenu = fileMenu(photo, this);
         FavoriteLabel();
         Zoom(1 / scale.ScaleX);
         animation.Stop();

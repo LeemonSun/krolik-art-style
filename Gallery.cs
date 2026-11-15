@@ -5,6 +5,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Collections.Specialized;
 using Microsoft.Win32;
 
 namespace Bestiary;
@@ -37,7 +38,7 @@ internal sealed class Gallery : Window
     private Border? afterRows;
     private int firstRow = -1, lastRow = -1, columns;
     private double rowHeight;
-    private CancellationTokenSource rowLoading = new();
+    private readonly Dictionary<int, (UniformGrid Grid, CancellationTokenSource Loading)> liveRows = [];
 
     public Gallery(Library library)
     {
@@ -49,6 +50,8 @@ internal sealed class Gallery : Window
         MinHeight = 620;
         WindowStartupLocation = WindowStartupLocation.CenterScreen;
         Background = Paint("#14131A");
+        UseLayoutRounding = true;
+        SnapsToDevicePixels = true;
         shell.Background = Background;
         shell.ColumnDefinitions.Add(new() { Width = new GridLength(216) });
         shell.ColumnDefinitions.Add(new());
@@ -110,7 +113,7 @@ internal sealed class Gallery : Window
             }
         };
         Closing += (_, e) => { if (importing) e.Cancel = true; };
-        Closed += (_, _) => { loading.Cancel(); rowLoading.Cancel(); };
+        Closed += (_, _) => { loading.Cancel(); ClearRows(); };
         photos = library.Scan();
         Render();
     }
@@ -160,8 +163,8 @@ internal sealed class Gallery : Window
     private void Render(bool resetScroll = false)
     {
         double position = resetScroll ? 0 : scroll.VerticalOffset;
+        ClearRows();
         visibleRows = null;
-        rowLoading.Cancel();
         loading.Cancel();
         loading.Dispose();
         loading = new CancellationTokenSource();
@@ -194,7 +197,7 @@ internal sealed class Gallery : Window
                 Photo cover = album.FirstOrDefault(p => p.Key == library.State.Covers.GetValueOrDefault(album.Key))
                     ?? album.OrderBy(CoverRank).ThenBy(p => p.Key).First();
                 string key = album.Key;
-                albumGrid.Children.Add(Tile(cover, key.Split('/')[^1], $"{album.Count():N0} фото", () => Go(key), null));
+                albumGrid.Children.Add(Tile(cover, key.Split('/')[^1], $"{album.Count():N0} фото", () => Go(key), Menu(cover)));
             }
             content.Children.Add(albumGrid);
         }
@@ -375,22 +378,23 @@ internal sealed class Gallery : Window
         double stride = height + (library.State.PhotoOnly ? 12 : 60);
         var gridOrigin = beforeRows.TranslatePoint(new Point(0, 0), content).Y;
         int rowCount = (galleryPhotos.Count + columnCount - 1) / columnCount;
-        int start = Math.Clamp((int)Math.Floor((scroll.VerticalOffset - gridOrigin) / stride) - 1, 0, rowCount - 1);
-        int end = Math.Min(rowCount, start + Math.Max(3, (int)Math.Ceiling(scroll.ViewportHeight / stride) + 3));
+        int firstVisible = (int)Math.Floor((scroll.VerticalOffset - gridOrigin) / stride);
+        int start = Math.Clamp(firstVisible - 2, 0, rowCount - 1);
+        int end = Math.Min(rowCount, start + Math.Max(5, (int)Math.Ceiling(scroll.ViewportHeight / stride) + 5));
         if (start == firstRow && end == lastRow && columns == columnCount && rowHeight == height) return;
+        if (columns != columnCount || rowHeight != height) ClearRows();
         firstRow = start;
         lastRow = end;
         columns = columnCount;
         rowHeight = height;
-        rowLoading.Cancel();
-        rowLoading.Dispose();
-        rowLoading = new CancellationTokenSource();
         beforeRows.Height = start * stride;
         afterRows.Height = (rowCount - end) * stride;
-        visibleRows.Children.Clear();
+        foreach (int row in liveRows.Keys.Where(r => r < start || r >= end).ToArray()) RemoveRow(row);
         for (int row = start; row < end; row++)
         {
+            if (liveRows.ContainsKey(row)) continue;
             var grid = new UniformGrid { Columns = columnCount, Rows = 1, Height = stride };
+            var pending = new CancellationTokenSource();
             for (int column = 0; column < columnCount; column++)
             {
                 int index = row * columnCount + column;
@@ -408,13 +412,29 @@ internal sealed class Gallery : Window
                     }
                     else if (grouped) Go(section, stack);
                     else OpenViewer(galleryPhotos, index);
-                }, Menu(photo), true));
+                }, Menu(photo), true, pending.Token));
             }
-            visibleRows.Children.Add(grid);
+            liveRows[row] = (grid, pending);
+            visibleRows.Children.Insert(row - start, grid);
         }
     }
 
-    private UIElement Tile(Photo photo, string title, string subtitle, Action open, ContextMenu? menu, bool inGallery = false)
+    private void RemoveRow(int row)
+    {
+        var entry = liveRows[row];
+        entry.Loading.Cancel();
+        entry.Loading.Dispose();
+        visibleRows?.Children.Remove(entry.Grid);
+        liveRows.Remove(row);
+    }
+
+    private void ClearRows()
+    {
+        foreach (int row in liveRows.Keys.ToArray()) RemoveRow(row);
+    }
+
+    private UIElement Tile(Photo photo, string title, string subtitle, Action open, ContextMenu? menu,
+        bool inGallery = false, CancellationToken? rowToken = null)
     {
         bool only = inGallery && library.State.PhotoOnly;
         bool hidden = library.State.HideMarked && library.State.Hidden.Contains(photo.Key);
@@ -426,7 +446,7 @@ internal sealed class Gallery : Window
         art.Children.Add(image);
         art.Children.Add(placeholder);
         if (!hidden && !photo.IsVideo)
-            _ = LoadImage(photo, image, placeholder, inGallery ? rowLoading.Token : loading.Token);
+            _ = LoadImage(photo, image, placeholder, rowToken ?? loading.Token);
         if (!only && library.State.Favorites.Contains(photo.Key))
         {
             var badge = Label("♥", 16, Gold, true, new Thickness(9));
@@ -462,7 +482,7 @@ internal sealed class Gallery : Window
         catch (OperationCanceledException) { }
     }
 
-    private ContextMenu Menu(Photo photo)
+    private ContextMenu Menu(Photo photo, Window? viewer = null)
     {
         var menu = new ContextMenu();
         void Item(string title, Action action)
@@ -471,11 +491,60 @@ internal sealed class Gallery : Window
             item.Click += (_, _) => action();
             menu.Items.Add(item);
         }
+        Item("Копировать файл", () => CopyFile(photo));
+        if (!photo.IsVideo) Item("Копировать изображение", () => CopyImage(photo));
+        Item("Удалить в корзину…", () =>
+        {
+            if (Recycle(photo, viewer ?? this)) viewer?.Close();
+        });
+        if (viewer is not null) return menu;
+        menu.Items.Add(new Separator());
         Item(library.State.Favorites.Contains(photo.Key) ? "Убрать из избранного" : "Добавить в избранное", () => Mutate(() => Toggle(library.State.Favorites, photo.Key)));
         Item("Сделать обложкой альбома", () => Mutate(() => library.State.Covers[photo.Album] = photo.Key));
         Item("Назначить серию…", () => SetSeries([photo]));
         Item(library.State.Hidden.Contains(photo.Key) ? "Снять отметку скрытия" : "Пометить для скрытия", () => Mutate(() => Toggle(library.State.Hidden, photo.Key)));
         return menu;
+    }
+
+    private void CopyFile(Photo photo)
+    {
+        try
+        {
+            if (!File.Exists(photo.Path)) throw new FileNotFoundException("Файл уже перемещён или удалён.");
+            Clipboard.SetFileDropList(new StringCollection { photo.Path });
+            status.Text = "Файл скопирован. Вставь его в Проводнике через Ctrl+V.";
+        }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Не удалось скопировать файл"); }
+    }
+
+    private async void CopyImage(Photo photo)
+    {
+        try
+        {
+            var bitmap = await library.Preview(photo, false, maxSize: int.MaxValue)
+                ?? throw new IOException("Не удалось прочитать изображение.");
+            Clipboard.SetImage(bitmap);
+            status.Text = "Изображение скопировано в буфер обмена.";
+        }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Не удалось скопировать изображение"); }
+    }
+
+    private bool Recycle(Photo photo, Window owner)
+    {
+        if (MessageBox.Show(owner, $"Переместить «{Path.GetFileName(photo.Path)}» из Bestiary в корзину Windows?",
+                "Удалить файл", MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No) != MessageBoxResult.Yes) return false;
+        try
+        {
+            library.Recycle(photo);
+            selected.Remove(photo.Key);
+            photos = library.Scan();
+            Render();
+            status.Text = "Файл перемещён в корзину Windows.";
+            return true;
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { MessageBox.Show(this, ex.Message, "Не удалось удалить файл"); }
+        return false;
     }
 
     private static void Toggle(HashSet<string> set, string key)
@@ -525,7 +594,7 @@ internal sealed class Gallery : Window
 
     private void OpenViewer(IReadOnlyList<Photo> list, int index)
     {
-        var viewer = new Viewer(this, library, list, index);
+        var viewer = new Viewer(this, library, list, index, Menu);
         viewer.ShowDialog();
         Render();
     }
@@ -601,7 +670,19 @@ internal sealed class Gallery : Window
         {
             Go("all");
             await Task.Delay(450);
-            scroll.ScrollToVerticalOffset(1300);
+            if (galleryPhotos.Count > 30)
+            {
+                var retained = liveRows.ToDictionary(p => p.Key, p => p.Value.Grid);
+                scroll.ScrollToVerticalOffset((rowHeight + 12) * 3);
+                await Task.Delay(350);
+                if (!liveRows.Any(p => retained.GetValueOrDefault(p.Key) == p.Value.Grid))
+                    throw new InvalidOperationException("При прокрутке пересозданы все соседние строки.");
+                var menu = Menu(galleryPhotos[0]);
+                if (!menu.Items.OfType<MenuItem>().Any(i => Equals(i.Header, "Копировать файл"))
+                    || !menu.Items.OfType<MenuItem>().Any(i => Equals(i.Header, "Удалить в корзину…")))
+                    throw new InvalidOperationException("В меню кадра отсутствуют команды файла.");
+            }
+            scroll.ScrollToVerticalOffset(2100);
             await Task.Delay(350);
             if (galleryPhotos.Count > 30 && firstRow <= 0)
                 throw new InvalidOperationException("Прокрутка галереи не загрузила следующие строки.");
