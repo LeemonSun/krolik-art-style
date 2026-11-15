@@ -484,10 +484,10 @@ internal sealed class Gallery : Window
 
     private ContextMenu Menu(Photo photo, Window? viewer = null)
     {
-        var menu = new ContextMenu();
+        var menu = new ContextMenu { Style = (Style)FindResource("FileMenu") };
         void Item(string title, Action action)
         {
-            var item = new MenuItem { Header = title };
+            var item = new MenuItem { Header = title, Style = (Style)FindResource("FileMenuItem") };
             item.Click += (_, _) => action();
             menu.Items.Add(item);
         }
@@ -498,7 +498,7 @@ internal sealed class Gallery : Window
             if (Recycle(photo, viewer ?? this)) viewer?.Close();
         });
         if (viewer is not null) return menu;
-        menu.Items.Add(new Separator());
+        menu.Items.Add(new Separator { Style = (Style)FindResource("FileMenuSeparator") });
         Item(library.State.Favorites.Contains(photo.Key) ? "Убрать из избранного" : "Добавить в избранное", () => Mutate(() => Toggle(library.State.Favorites, photo.Key)));
         Item("Сделать обложкой альбома", () => Mutate(() => library.State.Covers[photo.Album] = photo.Key));
         Item("Назначить серию…", () => SetSeries([photo]));

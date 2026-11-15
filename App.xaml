@@ -3,6 +3,55 @@
     <SolidColorBrush x:Key="Ink" Color="#EEE8DC"/>
     <SolidColorBrush x:Key="Muted" Color="#A8A3B2"/>
     <SolidColorBrush x:Key="Accent" Color="#DABA91"/>
+    <Style x:Key="FileMenu" TargetType="ContextMenu">
+      <Setter Property="Foreground" Value="#F7F1E8"/>
+      <Setter Property="Background" Value="#24212D"/>
+      <Setter Property="Padding" Value="5"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ContextMenu">
+            <Border Background="{TemplateBinding Background}" BorderBrush="#62576E" BorderThickness="1"
+                    CornerRadius="7" Padding="{TemplateBinding Padding}">
+              <ItemsPresenter/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="FileMenuItem" TargetType="MenuItem">
+      <Setter Property="Foreground" Value="#F7F1E8"/>
+      <Setter Property="Padding" Value="12,8"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Border x:Name="Selection" Background="Transparent" CornerRadius="4" Padding="{TemplateBinding Padding}">
+              <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                                TextElement.Foreground="{TemplateBinding Foreground}"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Selection" Property="Background" Value="#4A3C54"/>
+                <Setter Property="Foreground" Value="White"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Foreground" Value="#A9A0B3"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="FileMenuSeparator" TargetType="Separator">
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Separator">
+            <Border Height="1" Background="#51465C" Margin="8,4"/>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
     <Style TargetType="TextBlock">
       <Setter Property="Foreground" Value="{StaticResource Ink}"/>
       <Setter Property="FontFamily" Value="Segoe UI"/>
